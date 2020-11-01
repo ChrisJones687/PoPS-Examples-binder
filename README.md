@@ -1,2 +1,2 @@
-# PoPS-Examples-binder
-Runs rPoPS in a binder notebook alllowing new users to see how it works before downloading.
+# PoPS (Pest or Pathogen Spread) Model Examples in Binder <img src="images/PoPS_GIF_transparent" align="right" width="14%" />
+
