@@ -1,2 +1,2 @@
-# PoPS (Pest or Pathogen Spread) Model Examples in Binder <img src="images/PoPS_GIF_transparent" align="right" width="14%" />
+# PoPS (Pest or Pathogen Spread) Model R Examples in Binder <img src="images/PoPS_GIF_transparent.gif" align="right" width="14%" />
 
