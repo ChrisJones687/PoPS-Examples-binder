@@ -2,4 +2,4 @@
 
 Wheat Stripe Rust: [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/ChrisJones687/PoPS-Examples-binder/HEAD?filepath=WSR.ipynb)
 
-RStudio: [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/ChrisJones687/PoPS-Examples-binder/master?urlpath=rstudio)
+RStudio: [![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/ChrisJones687/PoPS-Examples-binder/main?urlpath=rstudio)
