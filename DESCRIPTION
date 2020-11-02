@@ -23,7 +23,9 @@ Imports:
     utils,
     MASS,
     methods,
-    folderfun
+    folderfun,
+    matrixStats,
+    ggplot2
 License: GPL-3 | file LICENSE
 
 
