@@ -22,7 +22,8 @@ Imports:
     sp,
     utils,
     MASS,
-    methods
+    methods,
+    folderfun
 License: GPL-3 | file LICENSE
 
 
