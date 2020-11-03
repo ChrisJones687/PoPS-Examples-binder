@@ -25,7 +25,8 @@ Imports:
     methods,
     folderfun,
     matrixStats,
-    ggplot2
+    ggplot2,
+    remotes
 License: GPL-3 | file LICENSE
 
 
