@@ -1,0 +1,1809 @@
+---
+title: "Wheat Strip Rust Example"
+author: "Brit Laginhas and Chris Jones"
+date: "10/31/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = TRUE
+)
+library(raster, warn.conflicts = F, quietly = T)
+library(folderfun, warn.conflicts = F, quietly = T)
+library(sp, warn.conflicts = F, quietly = T)
+library(matrixStats, warn.conflicts = F, quietly = T)
+library(ggplot2, warn.conflicts = F, quietly = T)
+library(devtools, warn.conflicts = F, quietly = T)
+library(PoPS, warn.conflicts = F, quietly = T)
+library(MASS, warn.conflicts = F, quietly = T)
+library(doParallel, warn.conflicts = F, quietly = T)
+library(lubridate, warn.conflicts = F, quietly = T)
+# suppressMessages(folderfun::setff("In","/home/jovyan/")) # Change to your local directory
+folderfun::setff("In", "C:/Users/Chris/Desktop/Projects/PoPS-Examples-binder/data/") # Change to your local directory
+```
+
+## Background
+
+This example is designed to simulate a field experiment for wheat strip rust with
+5 * 28 plots with 1.524 m x 1.524 m (5 ft by 5 ft) grid cells. The experiment was
+planted with a non-resistant variety of wheat and multiple treatments were performed. 
+This example will demonstrate setting up the data for the model and the treatments, 
+running calibration and validation, and comparing simulation results to observed 
+data. We are ignoring the effect of weather on disease spread for this example.
+
+## Data setup
+
+For the field experiment, the starting conditions of each field were identical. 
+Each field was inoculated so that 1.1% of the total population of wheat was 
+inoculated with WSR on 5/14/2014 in the cell row 3 column 4.
+
+```{r data_prep}
+res <- 1.524 # resolution of a pixel or cell
+ns_ext <- 5 # north south extent of the plots
+we_ext <- 28 # east west extent of the plots
+control <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res)
+initial_infection <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res)
+initial_infection[3, 4] <- 11
+inoculation_points <- rasterToPoints(initial_infection, spatial = TRUE)
+inoculation_points <- inoculation_points[inoculation_points$layer > 0, ]
+hosts <- raster::raster(matrix(1000, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res)
+total_hosts <- raster::raster(matrix(1000, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res)
+treatment_foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res)
+treatment_foci[3, 4] <- 1
+treatment_3x3 <- treatment_foci
+treatment_3x3[2:4, 3:5] <- 1
+treatment_5x5 <- treatment_foci
+treatment_5x5[1:5, 2:6] <- 1
+sample_locations <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res)
+sample_locations[3, c(4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24)] <- 1
+sample_locations[sample_locations == 0] <- NA
+sample_points <- rasterToPoints(sample_locations, spatial = TRUE)
+sample_points <- sample_points[sample_points$layer > 0, ]
+writeRaster(initial_infection, ffIn("infected.tif"), overwrite = TRUE)
+writeRaster(total_hosts, ffIn("total_hosts.tif"), overwrite = TRUE)
+writeRaster(hosts, ffIn("hosts.tif"), overwrite = TRUE)
+writeRaster(treatment_foci, ffIn("treatments_foci.tif"), overwrite = TRUE)
+writeRaster(treatment_3x3, ffIn("treatments_3x3.tif"), overwrite = TRUE)
+writeRaster(treatment_5x5, ffIn("treatments_5x5.tif"), overwrite = TRUE)
+writeRaster(sample_locations, ffIn("sample_locations.tif"), overwrite = TRUE)
+```
+
+## Plotting the experimental Setup
+
+Here are the 4 different sizes of treatment. Then the 3 culling or host removal treatments are
+applied at 2, 4, and 8 days.
+
+
+```{r experiment, echo=FALSE}
+plot(control, main = "Control Plots", sub = "With initial inoculation and sample locations", col = "gray95")
+plot(inoculation_points, pch = 20, col = "red", add = TRUE)
+plot(sample_points, add = TRUE)
+
+plot(treatment_foci, main = "Treatment Plots 1 Foci width", sub = "With initial inoculation and sample locations")
+plot(inoculation_points, add = TRUE, pch = 20, col = "red")
+plot(sample_points, add = TRUE)
+
+plot(treatment_3x3, main = "Treatment Plots 3 Foci width", sub = "With initial inoculation and sample locations")
+plot(inoculation_points, add = TRUE, pch = 20, col = "red")
+plot(sample_points, add = TRUE)
+
+plot(treatment_5x5, main = "Treatment Plots 5 Foci width", sub = "With initial inoculation and sample locations")
+plot(inoculation_points, add = TRUE, pch = 20, col = "red")
+plot(sample_points, add = TRUE)
+
+```
+
+
+## Field Data
+
+We are using the field data to build our calibration and validation raster data sets.
+
+```{r field data}
+# Read in observational data
+field_data <- read.csv(ffIn("Data.csv"))
+names(field_data) <- c(
+  "Treatment", "Block", "Size", "Timing",
+  "Plot", "Distance", "Severity_07-03", "Severity_06_26"
+)
+field_data$Plot <- as.integer(as.factor(field_data$Plot))
+field_data <- field_data[, c(1, 3:7)]
+
+# setting up control
+control <- reshape(field_data[field_data$Treatment == 1, ],
+  idvar = c("Distance", "Size", "Timing", "Treatment"),
+  timevar = "Plot", direction = "wide"
+)
+control$mean_severity <- rowMeans(control[, 5:9])
+control$sd_severity <- rowSds(as.matrix(control[, 5:9]))
+control$column <- 4 + control$Distance / 5
+
+end_infection_control <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res)
+for (i in seq_len(nrow(control))) {
+  end_infection_control[3, control$column[i]] <- control$mean_severity[i] * 10
+}
+
+if (!file.exists(ffIn("end_infection_control.tif"))) {
+  writeRaster(end_infection_control, ffIn("end_infection_control.tif"), overwrite = TRUE)
+}
+
+# setting up 1 focus width - early (2 day)
+early_1foci <- reshape(field_data[field_data$Treatment == 2, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+early_1foci$mean_severity <- rowMeans(early_1foci[, 5:8]) # calc mean severity across reps
+early_1foci$sd_severity <- rowSds(as.matrix(early_1foci[, 5:8])) # calc sd severity across reps
+early_1foci$column <- 4 + early_1foci$Distance / 5 # ask Chris
+end_infection_early_1foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for early_1foci treatment
+for (i in seq_len(nrow(early_1foci))) {
+  end_infection_early_1foci[3, early_1foci$column[i]] <- early_1foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_early_1foci.tif"))) {
+  writeRaster(end_infection_early_1foci, ffIn("end_infection_early_1foci.tif"), overwrite = TRUE)
+}
+
+# setting up 1 focus width - mid (4 day)
+mid_1foci <- reshape(field_data[field_data$Treatment == 3, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+mid_1foci$mean_severity <- rowMeans(mid_1foci[, 5:8]) # calc mean severity across reps
+mid_1foci$sd_severity <- rowSds(as.matrix(mid_1foci[, 5:8])) # calc sd severity across reps
+mid_1foci$column <- 4 + mid_1foci$Distance / 5 # ask Chris
+end_infection_mid_1foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for mid_1foci treatment
+for (i in seq_len(nrow(mid_1foci))) {
+  end_infection_mid_1foci[3, mid_1foci$column[i]] <- mid_1foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_mid_1foci.tif"))) {
+  writeRaster(end_infection_mid_1foci, ffIn("end_infection_mid_1foci.tif"), overwrite = TRUE)
+}
+
+# setting up 1 focus width - late (8 day)
+late_1foci <- reshape(field_data[field_data$Treatment == 4, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+late_1foci$mean_severity <- rowMeans(late_1foci[, 5:8]) # calc mean severity across reps
+late_1foci$sd_severity <- rowSds(as.matrix(late_1foci[, 5:8])) # calc sd severity across reps
+late_1foci$column <- 4 + late_1foci$Distance / 5 # ask Chris
+end_infection_late_1foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for late_1foci treatment
+for (i in seq_len(nrow(late_1foci))) {
+  end_infection_late_1foci[3, late_1foci$column[i]] <- late_1foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_late_1foci.tif"))) {
+  writeRaster(end_infection_late_1foci, ffIn("end_infection_late_1foci.tif"), overwrite = TRUE)
+}
+
+# setting up 3 focus width - early (2 day)
+early_3foci <- reshape(field_data[field_data$Treatment == 5, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+early_3foci$mean_severity <- rowMeans(early_3foci[, 5:7]) # calc mean severity across reps
+early_3foci$sd_severity <- rowSds(as.matrix(early_3foci[, 5:7])) # calc sd severity across reps
+early_3foci$column <- 4 + early_3foci$Distance / 5 # ask Chris
+end_infection_early_3foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for early_3foci treatment
+for (i in seq_len(nrow(early_3foci))) {
+  end_infection_early_3foci[3, early_3foci$column[i]] <- early_3foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_early_3foci.tif"))) {
+  writeRaster(end_infection_early_3foci, ffIn("end_infection_early_3foci.tif"), overwrite = TRUE)
+}
+
+# setting up 3 focus width - mid (4 day)
+mid_3foci <- reshape(field_data[field_data$Treatment == 6, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+mid_3foci$mean_severity <- rowMeans(mid_3foci[, 5:8]) # calc mean severity across reps
+mid_3foci$sd_severity <- rowSds(as.matrix(mid_3foci[, 5:8])) # calc sd severity across reps
+mid_3foci$column <- 4 + mid_3foci$Distance / 5 # ask Chris
+end_infection_mid_3foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for mid_3foci treatment
+for (i in seq_len(nrow(mid_3foci))) {
+  end_infection_mid_3foci[3, mid_3foci$column[i]] <- mid_3foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_mid_3foci.tif"))) {
+  writeRaster(end_infection_mid_3foci, ffIn("end_infection_mid_3foci.tif"), overwrite = TRUE)
+}
+
+# setting up 3 focus width - late (8 day)
+late_3foci <- reshape(field_data[field_data$Treatment == 7, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+late_3foci$mean_severity <- rowMeans(late_3foci[, 5:7]) # calc mean severity across reps
+late_3foci$sd_severity <- rowSds(as.matrix(late_3foci[, 5:7])) # calc sd severity across reps
+late_3foci$column <- 4 + late_3foci$Distance / 5 # ask Chris
+end_infection_late_3foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for late_3foci treatment
+for (i in seq_len(nrow(late_3foci))) {
+  end_infection_late_3foci[3, late_3foci$column[i]] <- late_3foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_late_3foci.tif"))) {
+  writeRaster(end_infection_late_3foci, ffIn("end_infection_late_3foci.tif"), overwrite = TRUE)
+}
+
+# setting up 5 focus width - early (2 day)
+early_5foci <- reshape(field_data[field_data$Treatment == 8, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+early_5foci$mean_severity <- rowMeans(early_5foci[, 5:7]) # calc mean severity across reps
+early_5foci$sd_severity <- rowSds(as.matrix(early_5foci[, 5:7])) # calc sd severity across reps
+early_5foci$column <- 4 + early_5foci$Distance / 5 # ask Chris
+end_infection_early_5foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for early_5foci treatment
+for (i in seq_len(nrow(early_5foci))) {
+  end_infection_early_5foci[3, early_5foci$column[i]] <- early_5foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_early_5foci.tif"))) {
+  writeRaster(end_infection_early_5foci, ffIn("end_infection_early_5foci.tif"), overwrite = TRUE)
+}
+
+# setting up 5 focus width - mid (4 day)
+mid_5foci <- reshape(field_data[field_data$Treatment == 9, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+mid_5foci$mean_severity <- rowMeans(mid_5foci[, 5:7]) # calc mean severity across reps
+mid_5foci$sd_severity <- rowSds(as.matrix(mid_5foci[, 5:7])) # calc sd severity across reps
+mid_5foci$column <- 4 + mid_5foci$Distance / 5 # ask Chris
+end_infection_mid_5foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for mid_5foci treatment
+for (i in seq_len(nrow(mid_5foci))) {
+  end_infection_mid_5foci[3, mid_5foci$column[i]] <- mid_5foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_mid_5foci.tif"))) {
+  writeRaster(end_infection_mid_5foci, ffIn("end_infection_mid_5foci.tif"), overwrite = TRUE)
+}
+
+# setting up 5 focus width - late (8 day)
+late_5foci <- reshape(field_data[field_data$Treatment == 10, ], idvar = c("Distance", "Size", "Timing", "Treatment"), timevar = "Plot", direction = "wide") # reshape data into wide format
+late_5foci$mean_severity <- rowMeans(late_5foci[, 5:7]) # calc mean severity across reps
+late_5foci$sd_severity <- rowSds(as.matrix(late_5foci[, 5:7])) # calc sd severity across reps
+late_5foci$column <- 4 + late_5foci$Distance / 5 # ask Chris
+end_infection_late_5foci <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res) # create empty raster to accept severity values for late_5foci treatment
+for (i in seq_len(nrow(late_5foci))) {
+  end_infection_late_5foci[3, late_5foci$column[i]] <- late_5foci$mean_severity[i] * 10
+}
+if (!file.exists(ffIn("end_infection_late_5foci.tif"))) {
+  writeRaster(end_infection_late_5foci, ffIn("end_infection_late_5foci.tif"), overwrite = TRUE)
+}
+```
+
+## Setting up the calibration
+
+```{r eval=FALSE, include=FALSE}
+
+infected_years_file <- ffIn("end_infection_control.tif")
+number_of_observations <- 12 # This is the number of infected cells or total observations make consistent across each temporal step of your data
+prior_number_of_observations <- 0 # in this case no weight is given to the prior
+prior_means <- c(0, 0, 0, 0, 0, 0) # having all 0's
+prior_cov_matrix <- matrix(ncol = 6, nrow = 6, 0)
+params_to_estimate <- c(T, T, F, F, F, F) ### 1st: reproductive rates, 2nd: natural distance, 3rd: percent natural, 4tH: anthropogenic distance, 5th Natural Kappa, 6th anthropogenic kappa
+number_of_generations <- 7 # this is how many generations the approximate bayesian computation algorithm runs
+generation_size <- 50 # the number of accepted runs of the model below the threshold.
+checks <- c(90, 20000, 1000, 2000) # 1: difference between number of infected cells in different years, 2: difference in distance in different years
+# 3 and 4 don't matter if you keep the metric of success the same
+infected_file <- ffIn("infected.tif")
+host_file <- ffIn("hosts.tif")
+total_populations_file <- ffIn("total_hosts.tif")
+temp <- FALSE
+temperature_coefficient_file <- ""
+precip <- FALSE
+precipitation_coefficient_file <- ""
+model_type <- "SEI"
+latency_period <- 16
+time_step <- "day"
+season_month_start <- 1
+season_month_end <- 12
+start_date <- "2014-10-17"
+end_date <- "2014-12-31"
+use_lethal_temperature <- FALSE
+temperature_file <- ""
+lethal_temperature <- -30
+lethal_temperature_month <- 1
+mortality_on <- FALSE
+mortality_rate <- 0
+mortality_time_lag <- 0
+management <- FALSE
+treatment_dates <- c("2014-11-24") # currently set random date within the date range (need to change for actual treatments)
+treatments_file <- ""
+treatment_method <- "all infected"
+natural_kernel_type <- "cauchy"
+anthropogenic_kernel_type <- "cauchy"
+natural_dir <- "E"
+natural_kappa <- 0
+anthropogenic_dir <- "NONE"
+anthropogenic_kappa <- 0
+pesticide_duration <- c(0)
+pesticide_efficacy <- 1.0
+mask <- raster(ffIn("sample_locations.tif"))
+success_metric <- "residual error" # residual error makes a direct comparison to the field measurements that are of disease severity or infected area
+output_frequency <- "year"
+output_frequency_n <- 1
+movements_file <- "" ## ignore - for when hosts move (animals moving from farm to farm)
+use_movements <- FALSE
+percent_natural_dispersal <- 1.0
+anthropogenic_distance_scale <- 0.0
+start_exposed <- TRUE
+generate_stochasticity <- TRUE
+establishment_stochasticity <- TRUE
+movement_stochasticity <- TRUE
+deterministic <- FALSE
+establishment_probability <- 0.5
+dispersal_percentage <- 0.99
+quarantine_areas_file <- ""
+use_quarantine <- FALSE
+use_spreadrates <- FALSE
+calibration_method <- "ABC"
+number_of_iterations <- 100000
+
+calibrated_data <- calibrate(
+  infected_years_file,
+  number_of_observations,
+  prior_number_of_observations,
+  prior_means,
+  prior_cov_matrix,
+  params_to_estimate,
+  number_of_generations,
+  generation_size,
+  checks,
+  infected_file,
+  host_file,
+  total_populations_file,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  natural_kappa,
+  anthropogenic_dir,
+  anthropogenic_kappa,
+  pesticide_duration,
+  pesticide_efficacy,
+  mask,
+  success_metric,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates,
+  calibration_method,
+  number_of_iterations
+)
+
+
+means_control <- as.data.frame(calibrated_data$posterior_means)
+cov_control <- as.data.frame(calibrated_data$posterior_cov_matrix)
+raw_calib_control <- as.data.frame(calibrated_data$raw_calibration_data)
+total_obs_control <- as.data.frame(calibrated_data$total_number_of_observations)
+write.csv(total_obs_control, ffIn("total_obs.csv"))
+write.csv(means_control, ffIn("means_control.csv"), row.names = FALSE)
+write.csv(cov_control, ffIn("cov_control.csv"), row.names = FALSE)
+write.csv(raw_calib_control, ffIn("raw_calib_control.csv"))
+```
+
+
+## Plotting Calibration curves
+```{r calibration curves, echo=FALSE}
+parameter_means <- as.matrix(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+
+parameters <- MASS::mvrnorm(
+  200000,
+  parameter_means,
+  parameter_cov_matrix
+)
+while (any(parameters[, 1] < 0 |
+  parameters[, 2] < 0 |
+  parameters[, 3] > 1 |
+  parameters[, 3] < 0 |
+  parameters[, 4] < 0 |
+  parameters[, 5] < 0 |
+  parameters[, 6] < 0)) {
+  number_of_draws <- nrow(parameters[parameters[, 1] < 0 |
+    parameters[, 2] < 0 |
+    parameters[, 3] > 1 |
+    parameters[, 3] < 0 |
+    parameters[, 4] < 0 |
+    parameters[, 5] < 0 |
+    parameters[, 6] < 0, ])
+  if (is.null(number_of_draws)) {
+    number_of_draws <- 1
+  }
+
+  parameters[parameters[, 1] < 0 |
+    parameters[, 2] < 0 |
+    parameters[, 3] > 1 |
+    parameters[, 3] < 0 |
+    parameters[, 4] < 0 |
+    parameters[, 5] < 0 |
+    parameters[, 6] < 0, ] <-
+    MASS::mvrnorm(
+      number_of_draws,
+      parameter_means,
+      parameter_cov_matrix
+    )
+}
+parameters <- data.frame(parameters)
+
+ggplot(parameters, aes(x = X1, fill = X1)) +
+  geom_density(alpha = 0.5) +
+  theme_classic()
+ggplot(parameters, aes(x = X2, fill = X1)) +
+  geom_density(alpha = 0.5) +
+  theme_classic()
+```
+## Validation
+```{r eval=FALSE, include=FALSE}
+
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+number_of_iterations <- 10
+number_of_cores <- 4
+# parameter_means_c<-means_control$`calibrated_data$posterior_means`[1:6]
+
+validated_data <- validate(infected_years_file,
+  number_of_iterations,
+  number_of_cores,
+  parameter_means,
+  parameter_cov_matrix,
+  infected_file,
+  host_file,
+  total_populations_file,
+  temp = FALSE,
+  temperature_coefficient_file = "",
+  precip = FALSE,
+  precipitation_coefficient_file = "",
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature = FALSE,
+  temperature_file = "",
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on = FALSE,
+  mortality_rate,
+  mortality_time_lag,
+  management = FALSE,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  pesticide_duration,
+  pesticide_efficacy,
+  mask,
+  success_metric,
+  output_frequency,
+  movements_file,
+  use_movements,
+  start_exposed
+)
+```
+## Run model
+
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+infected_file <- ffIn("infected.tif")
+host_file <- ffIn("hosts.tif")
+total_populations_file <- ffIn("total_hosts.tif")
+temp <- FALSE
+temperature_coefficient_file <- ""
+precip <- FALSE
+precipitation_coefficient_file <- ""
+model_type <- "SEI"
+latency_period <- 15
+time_step <- "day"
+season_month_start <- 1
+season_month_end <- 12
+use_lethal_temperature <- FALSE
+temperature_file <- ""
+lethal_temperature <- -30
+lethal_temperature_month <- 1
+mortality_on <- FALSE
+mortality_rate <- 0
+mortality_time_lag <- 0
+management <- FALSE
+treatment_dates <- c("2014-05-04") # currently set to the latent period but no treatment applied
+treatments_file <- ""
+treatment_method <- "ratio"
+natural_kernel_type <- "cauchy"
+anthropogenic_kernel_type <- "cauchy"
+natural_dir <- "E"
+anthropogenic_dir <- "NONE"
+pesticide_duration <- c(0)
+pesticide_efficacy <- 1.0
+output_frequency <- "year"
+output_frequency_n <- 1
+movements_file <- "" ## ignore - for when hosts move (animals moving from farm to farm)
+use_movements <- FALSE
+
+
+number_of_iterations <- 100
+number_of_cores <- 20
+start_exposed <- TRUE
+generate_stochasticity <- TRUE
+establishment_stochasticity <- TRUE
+movement_stochasticity <- TRUE
+deterministic <- FALSE
+establishment_probability <- 0.5
+dispersal_percentage <- 0.99
+quarantine_areas_file <- ""
+use_quarantine <- FALSE
+use_spreadrates <- FALSE
+
+control_sim <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(control_sim$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(control_sim$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+control_output <- as.data.frame(cbind(distance_from_focus, mean))
+control_output$standard_deviation <- standard_deviation
+control_output$observed <- extract(end_infection_control, sample_points)
+
+control_outputs <-
+  reshape(control_output,
+    idvar = "distance_from_focus",
+    varying = c("observed", "mean"),
+    v.names = c("mean_disease_prevalence"),
+    times = c("observed", "mean"),
+    direction = "long"
+  )
+
+control_output$difference <-
+  control_output$mean - control_output$observed
+
+control_outputs$standard_deviation[control_outputs$time == "observed"] <-
+  control$sd_severity * 10
+
+control_outputs$time[control_outputs$time == "observed"] <- "Field"
+control_outputs$time[control_outputs$time == "mean"] <- "Simulated"
+control_outputs$standard_deviation <- control_outputs$standard_deviation / 1000
+control_outputs$mean_disease_prevalence <-
+  control_outputs$mean_disease_prevalence / 1000
+
+control_outputs$treatment <- "None"
+control_outputs$culltime <- "None"
+
+ggplot(
+  control_outputs,
+  aes(distance_from_focus,
+    mean_disease_prevalence,
+    group = time,
+    color = time
+  )
+) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(
+    aes(
+      ymin = mean_disease_prevalence - standard_deviation,
+      ymax = mean_disease_prevalence + standard_deviation
+    ),
+    width = .1
+  ) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+```
+
+Run PoPS for different treatment scenarios (3 different treatment sizes and 3 different treatment timings)
+
+Small 15 days
+
+```{r}
+# Treating just the focus 15 days from the latent period
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-19")
+management <- TRUE
+treatments_file <- ffIn("treatments_foci.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+number_of_iterations <- 100
+number_of_cores <- 20
+start_exposed <- TRUE
+
+foci_day30_1foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_day30_1foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_day30_1foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+day30_1foci_outputs <- foci_output
+day30_1foci_outputs$time <- "Simulated"
+names(day30_1foci_outputs)[2] <- "mean_disease_prevalence"
+day30_1foci_outputs$standard_deviation <- day30_1foci_outputs$standard_deviation / 1000
+day30_1foci_outputs$mean_disease_prevalence <- day30_1foci_outputs$mean_disease_prevalence / 1000
+
+day30_1foci_outputs$treatment <- "focus"
+day30_1foci_outputs$culltime <- 30
+
+```
+
+Small 8 days
+
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-12")
+management <- TRUE
+treatments_file <- ffIn("treatments_foci.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+number_of_iterations <- 100
+number_of_cores <- 20
+start_exposed <- TRUE
+
+foci_late_1foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_late_1foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_late_1foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_late_1foci, sample_points)
+
+late_1foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+late_1foci_outputs$standard_deviation[late_1foci_outputs$time == "observed"] <- late_1foci$sd_severity * 10
+
+late_1foci_outputs$time[late_1foci_outputs$time == "observed"] <- "Field"
+late_1foci_outputs$time[late_1foci_outputs$time == "mean"] <- "Simulated"
+late_1foci_outputs$standard_deviation <- late_1foci_outputs$standard_deviation / 1000
+late_1foci_outputs$mean_disease_prevalence <- late_1foci_outputs$mean_disease_prevalence / 1000
+
+late_1foci_outputs$treatment <- "focus"
+late_1foci_outputs$culltime <- 23
+
+ggplot(late_1foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .2, position = position_dodge(0.5)) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+```
+
+Small 4 days
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-08")
+management <- TRUE
+treatments_file <- ffIn("treatments_foci.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+number_of_iterations <- 100
+number_of_cores <- 10
+start_exposed <- TRUE
+
+foci_mid_1foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_mid_1foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_mid_1foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_mid_1foci, sample_points)
+
+mid_1foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+mid_1foci_outputs$standard_deviation[mid_1foci_outputs$time == "observed"] <- mid_1foci$sd_severity * 10
+
+mid_1foci_outputs$time[mid_1foci_outputs$time == "observed"] <- "Field"
+mid_1foci_outputs$time[mid_1foci_outputs$time == "mean"] <- "Simulated"
+mid_1foci_outputs$standard_deviation <- mid_1foci_outputs$standard_deviation / 1000
+mid_1foci_outputs$mean_disease_prevalence <- mid_1foci_outputs$mean_disease_prevalence / 1000
+
+mid_1foci_outputs$treatment <- "focus"
+mid_1foci_outputs$culltime <- 19
+
+ggplot(mid_1foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+```
+
+
+Small 2 days
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-06")
+management <- TRUE
+treatments_file <- ffIn("treatments_foci.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+number_of_iterations <- 100
+number_of_cores <- 10
+start_exposed <- TRUE
+
+foci_early_1foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_early_1foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_early_1foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_early_1foci, sample_points)
+
+early_1foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+early_1foci_outputs$standard_deviation[early_1foci_outputs$time == "observed"] <- early_1foci$sd_severity * 10
+
+early_1foci_outputs$time[early_1foci_outputs$time == "observed"] <- "Field"
+early_1foci_outputs$time[early_1foci_outputs$time == "mean"] <- "Simulated"
+early_1foci_outputs$standard_deviation <- early_1foci_outputs$standard_deviation / 1000
+early_1foci_outputs$mean_disease_prevalence <- early_1foci_outputs$mean_disease_prevalence / 1000
+
+early_1foci_outputs$treatment <- "focus"
+early_1foci_outputs$culltime <- 17
+
+ggplot(early_1foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+```
+
+Medium 15 days
+
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-19")
+management <- TRUE
+treatments_file <- ffIn("treatments_3x3.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+number_of_iterations <- 100
+number_of_cores <- 20
+start_exposed <- TRUE
+
+foci_day30_3foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_day30_3foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_day30_3foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+
+day30_3foci_outputs <- foci_output
+day30_3foci_outputs$time <- "Simulated"
+names(day30_3foci_outputs)[2] <- "mean_disease_prevalence"
+day30_3foci_outputs$standard_deviation <- day30_3foci_outputs$standard_deviation / 1000
+day30_3foci_outputs$mean_disease_prevalence <- day30_3foci_outputs$mean_disease_prevalence / 1000
+
+day30_3foci_outputs$treatment <- "medium"
+day30_3foci_outputs$culltime <- 30
+
+```
+
+Medium 8 day
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-12")
+management <- TRUE
+treatments_file <- ffIn("treatments_3x3.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+parameter_means[1] <- 2.60
+parameter_means[2] <- 1.30
+number_of_iterations <- 100
+number_of_cores <- 10
+start_exposed <- TRUE
+
+foci_late_3foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_late_3foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_late_3foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_mid_3foci, sample_points)
+
+late_3foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+late_3foci_outputs$standard_deviation[late_3foci_outputs$time == "observed"] <- mid_3foci$sd_severity * 10
+
+late_3foci_outputs$time[late_3foci_outputs$time == "observed"] <- "Field"
+late_3foci_outputs$time[late_3foci_outputs$time == "mean"] <- "Simulated"
+late_3foci_outputs$standard_deviation <- late_3foci_outputs$standard_deviation / 1000
+late_3foci_outputs$mean_disease_prevalence <- late_3foci_outputs$mean_disease_prevalence / 1000
+
+late_3foci_outputs$treatment <- "medium"
+late_3foci_outputs$culltime <- 23
+
+ggplot(late_3foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+```
+
+
+Medium 4 day
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-08")
+management <- TRUE
+treatments_file <- ffIn("treatments_3x3.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+number_of_iterations <- 100
+number_of_cores <- 20
+start_exposed <- TRUE
+
+foci_mid_3foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_mid_3foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_mid_3foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_mid_3foci, sample_points)
+
+mid_3foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+mid_3foci_outputs$standard_deviation[mid_3foci_outputs$time == "observed"] <- mid_3foci$sd_severity * 10
+
+mid_3foci_outputs$time[mid_3foci_outputs$time == "observed"] <- "Field"
+mid_3foci_outputs$time[mid_3foci_outputs$time == "mean"] <- "Simulated"
+mid_3foci_outputs$standard_deviation <- mid_3foci_outputs$standard_deviation / 1000
+mid_3foci_outputs$mean_disease_prevalence <- mid_3foci_outputs$mean_disease_prevalence / 1000
+
+mid_3foci_outputs$treatment <- "medium"
+mid_3foci_outputs$culltime <- 19
+
+ggplot(mid_3foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+```
+
+
+Medium 2 day
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-06")
+management <- TRUE
+treatments_file <- ffIn("treatments_3x3.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+parameter_means[1] <- 2.60
+parameter_means[2] <- 1.30
+number_of_iterations <- 100
+number_of_cores <- 10
+start_exposed <- TRUE
+
+foci_early_3foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_early_3foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_early_3foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_early_3foci, sample_points)
+
+early_3foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+early_3foci_outputs$standard_deviation[early_3foci_outputs$time == "observed"] <- early_3foci$sd_severity * 10
+
+early_3foci_outputs$time[early_3foci_outputs$time == "observed"] <- "Field"
+early_3foci_outputs$time[early_3foci_outputs$time == "mean"] <- "Simulated"
+early_3foci_outputs$standard_deviation <- early_3foci_outputs$standard_deviation / 1000
+early_3foci_outputs$mean_disease_prevalence <- early_3foci_outputs$mean_disease_prevalence / 1000
+
+early_3foci_outputs$treatment <- "medium"
+early_3foci_outputs$culltime <- 17
+
+ggplot(early_3foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+```
+Medium 15 days
+
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-19")
+management <- TRUE
+treatments_file <- ffIn("treatments_5x5.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+number_of_iterations <- 100
+number_of_cores <- 20
+start_exposed <- TRUE
+
+foci_day30_5foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_day30_5foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_day30_5foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+
+day30_5foci_outputs <- foci_output
+day30_5foci_outputs$time <- "Simulated"
+names(day30_5foci_outputs)[2] <- "mean_disease_prevalence"
+day30_5foci_outputs$standard_deviation <- day30_5foci_outputs$standard_deviation / 1000
+day30_5foci_outputs$mean_disease_prevalence <- day30_5foci_outputs$mean_disease_prevalence / 1000
+
+day30_5foci_outputs$treatment <- "large"
+day30_5foci_outputs$culltime <- 30
+
+```
+
+
+Large 8 day
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-12")
+management <- TRUE
+treatments_file <- ffIn("treatments_5x5.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+parameter_means[1] <- 2.95
+parameter_means[2] <- 1.75
+number_of_iterations <- 100
+number_of_cores <- 10
+start_exposed <- TRUE
+
+foci_late_5foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_late_5foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_late_5foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_late_5foci, sample_points)
+
+late_5foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+late_5foci_outputs$standard_deviation[late_5foci_outputs$time == "observed"] <- late_5foci$sd_severity * 10
+
+late_5foci_outputs$time[late_5foci_outputs$time == "observed"] <- "Field"
+late_5foci_outputs$time[late_5foci_outputs$time == "mean"] <- "Simulated"
+late_5foci_outputs$standard_deviation <- late_5foci_outputs$standard_deviation / 1000
+late_5foci_outputs$mean_disease_prevalence <- late_5foci_outputs$mean_disease_prevalence / 1000
+
+late_5foci_outputs$treatment <- "large"
+late_5foci_outputs$culltime <- 23
+
+ggplot(late_5foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+```
+
+
+Medium 4 day
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-08")
+management <- TRUE
+treatments_file <- ffIn("treatments_5x5.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+parameter_means[1] <- 2.95
+parameter_means[2] <- 1.75
+number_of_iterations <- 100
+number_of_cores <- 10
+start_exposed <- TRUE
+
+foci_mid_5foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_mid_5foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_mid_5foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_mid_5foci, sample_points)
+
+mid_5foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+mid_5foci_outputs$standard_deviation[mid_5foci_outputs$time == "observed"] <- mid_5foci$sd_severity * 10
+
+mid_5foci_outputs$time[mid_5foci_outputs$time == "observed"] <- "Field"
+mid_5foci_outputs$time[mid_5foci_outputs$time == "mean"] <- "Simulated"
+mid_5foci_outputs$standard_deviation <- mid_5foci_outputs$standard_deviation / 1000
+mid_5foci_outputs$mean_disease_prevalence <- mid_5foci_outputs$mean_disease_prevalence / 1000
+
+mid_5foci_outputs$treatment <- "large"
+mid_5foci_outputs$culltime <- 19
+
+ggplot(mid_5foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+```
+
+
+Medium 2 day
+```{r}
+start_date <- "2014-04-20"
+end_date <- "2014-07-03"
+treatment_dates <- c("2014-05-06")
+management <- TRUE
+treatments_file <- ffIn("treatments_5x5.tif")
+parameter_means <- t(read.csv(ffIn("means_control.csv")))
+parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
+parameter_means[1] <- 2.95
+parameter_means[2] <- 1.75
+number_of_iterations <- 100
+number_of_cores <- 10
+start_exposed <- TRUE
+
+foci_early_5foci <- pops_multirun(infected_file,
+  host_file,
+  total_populations_file,
+  parameter_means,
+  parameter_cov_matrix,
+  temp,
+  temperature_coefficient_file,
+  precip,
+  precipitation_coefficient_file,
+  model_type,
+  latency_period,
+  time_step,
+  season_month_start,
+  season_month_end,
+  start_date,
+  end_date,
+  use_lethal_temperature,
+  temperature_file,
+  lethal_temperature,
+  lethal_temperature_month,
+  mortality_on,
+  mortality_rate,
+  mortality_time_lag,
+  management,
+  treatment_dates,
+  treatments_file,
+  treatment_method,
+  natural_kernel_type,
+  anthropogenic_kernel_type,
+  natural_dir,
+  anthropogenic_dir,
+  number_of_iterations,
+  number_of_cores,
+  pesticide_duration,
+  pesticide_efficacy,
+  random_seed = NULL,
+  output_frequency,
+  output_frequency_n,
+  movements_file,
+  use_movements,
+  start_exposed,
+  generate_stochasticity,
+  establishment_stochasticity,
+  movement_stochasticity,
+  deterministic,
+  establishment_probability,
+  dispersal_percentage,
+  quarantine_areas_file,
+  use_quarantine,
+  use_spreadrates
+)
+
+mean <- as.vector((extract(foci_early_5foci$simulation_mean, sample_points)))
+standard_deviation <- as.vector((extract(foci_early_5foci$simulation_sd, sample_points)))
+distance_from_focus <- c(0, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+foci_output <- as.data.frame(cbind(distance_from_focus, mean))
+foci_output$standard_deviation <- standard_deviation
+foci_output$observed <- extract(end_infection_early_5foci, sample_points)
+
+early_5foci_outputs <- reshape(foci_output, idvar = "distance_from_focus", varying = c("observed", "mean"), v.name = c("mean_disease_prevalence"), times = c("observed", "mean"), direction = "long")
+
+early_5foci_outputs$standard_deviation[early_5foci_outputs$time == "observed"] <- early_5foci$sd_severity * 10
+
+early_5foci_outputs$time[early_5foci_outputs$time == "observed"] <- "Field"
+early_5foci_outputs$time[early_5foci_outputs$time == "mean"] <- "Simulated"
+early_5foci_outputs$standard_deviation <- early_5foci_outputs$standard_deviation / 1000
+early_5foci_outputs$mean_disease_prevalence <- early_5foci_outputs$mean_disease_prevalence / 1000
+
+early_5foci_outputs$treatment <- "large"
+early_5foci_outputs$culltime <- 17
+
+ggplot(early_5foci_outputs, aes(distance_from_focus, mean_disease_prevalence, group = time, color = time)) +
+  geom_point(aes(shape = time)) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .2) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+```
+
+
+```{r}
+all_outputs <- 
+  rbind(early_5foci_outputs, early_3foci_outputs, early_1foci_outputs,
+        mid_5foci_outputs, mid_3foci_outputs, mid_1foci_outputs,
+        late_5foci_outputs, late_3foci_outputs, late_1foci_outputs,
+        day30_1foci_outputs, day30_3foci_outputs, day30_5foci_outputs,
+        control_outputs)
+
+sim_outputs <- all_outputs[all_outputs$time == "Simulated",]
+
+large_outputs <- sim_outputs[sim_outputs$treatment %in% c("large", "None"),]
+medium_outputs <- sim_outputs[sim_outputs$treatment %in% c("medium", "None"),]
+focus_outputs <- sim_outputs[sim_outputs$treatment %in% c("focus", "None"),]
+
+early_outputs <- sim_outputs[sim_outputs$culltime %in% c(17, "None"),]
+mid_outputs <- sim_outputs[sim_outputs$culltime %in% c(19, "None"),]
+late_outputs <- sim_outputs[sim_outputs$culltime %in% c(23, "None"),]
+latest_outputs <- sim_outputs[sim_outputs$culltime %in% c(30, "None"),]
+
+ggplot(large_outputs, aes(distance_from_focus, mean_disease_prevalence, group = factor(culltime), color = factor(culltime))) +
+  geom_point(aes(shape = factor(culltime))) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+ggplot(medium_outputs, aes(distance_from_focus, mean_disease_prevalence, group = factor(culltime), color = factor(culltime))) +
+  geom_point(aes(shape = factor(culltime))) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+ggplot(focus_outputs, aes(distance_from_focus, mean_disease_prevalence, group = factor(culltime), color = factor(culltime))) +
+  geom_point(aes(shape = factor(culltime))) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+ggplot(early_outputs, aes(distance_from_focus, mean_disease_prevalence, group = factor(treatment), color = factor(treatment))) +
+  geom_point(aes(shape = factor(treatment))) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+ggplot(mid_outputs, aes(distance_from_focus, mean_disease_prevalence, group = factor(treatment), color = factor(treatment))) +
+  geom_point(aes(shape = factor(treatment))) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+ggplot(late_outputs, aes(distance_from_focus, mean_disease_prevalence, group = factor(treatment), color = factor(treatment))) +
+  geom_point(aes(shape = factor(treatment))) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+ggplot(latest_outputs, aes(distance_from_focus, mean_disease_prevalence, group = factor(treatment), color = factor(treatment))) +
+  geom_point(aes(shape = factor(treatment))) +
+  geom_errorbar(aes(ymin = mean_disease_prevalence - standard_deviation, ymax = mean_disease_prevalence + standard_deviation), width = .1) +
+  theme_classic() +
+  theme(legend.title = element_blank())
+
+```
