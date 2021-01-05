@@ -62,6 +62,11 @@ sample_locations[3, c(4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24)] <- 1
 sample_locations[sample_locations == 0] <- NA
 sample_points <- rasterToPoints(sample_locations, spatial = TRUE)
 sample_points <- sample_points[sample_points$layer > 0, ]
+all_sample_locations <- raster::raster(matrix(0, nrow = ns_ext, ncol = we_ext), xmn = 0, xmx = we_ext * res, ymn = 0, ymx = ns_ext * res)
+all_sample_locations[3, c(4, 5, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24)] <- 1
+all_sample_locations[sample_locations == 0] <- NA
+all_sample_points <- rasterToPoints(sample_locations, spatial = TRUE)
+all_sample_points <- sample_points[sample_points$layer > 0, ]
 writeRaster(initial_infection, ffIn("infected.tif"), overwrite = TRUE)
 writeRaster(total_hosts, ffIn("total_hosts.tif"), overwrite = TRUE)
 writeRaster(hosts, ffIn("hosts.tif"), overwrite = TRUE)
@@ -529,14 +534,14 @@ natural_dir <- "E"
 anthropogenic_dir <- "NONE"
 pesticide_duration <- c(0)
 pesticide_efficacy <- 1.0
-output_frequency <- "year"
+output_frequency <- "day"
 output_frequency_n <- 1
 movements_file <- "" ## ignore - for when hosts move (animals moving from farm to farm)
 use_movements <- FALSE
 
 
-number_of_iterations <- 100
-number_of_cores <- 20
+number_of_iterations <- 1000
+number_of_cores <- 10
 start_exposed <- TRUE
 generate_stochasticity <- TRUE
 establishment_stochasticity <- TRUE
@@ -665,8 +670,8 @@ management <- TRUE
 treatments_file <- ffIn("treatments_foci.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-number_of_iterations <- 100
-number_of_cores <- 20
+number_of_iterations <- 1000
+number_of_cores <- 10
 start_exposed <- TRUE
 
 foci_day30_1foci <- pops_multirun(infected_file,
@@ -747,8 +752,8 @@ management <- TRUE
 treatments_file <- ffIn("treatments_foci.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-number_of_iterations <- 100
-number_of_cores <- 20
+number_of_iterations <- 1000
+number_of_cores <- 10
 start_exposed <- TRUE
 
 foci_late_1foci <- pops_multirun(infected_file,
@@ -839,7 +844,7 @@ management <- TRUE
 treatments_file <- ffIn("treatments_foci.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-number_of_iterations <- 100
+number_of_iterations <- 1000
 number_of_cores <- 10
 start_exposed <- TRUE
 
@@ -931,7 +936,7 @@ management <- TRUE
 treatments_file <- ffIn("treatments_foci.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-number_of_iterations <- 100
+number_of_iterations <- 1000
 number_of_cores <- 10
 start_exposed <- TRUE
 
@@ -1023,8 +1028,8 @@ management <- TRUE
 treatments_file <- ffIn("treatments_3x3.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-number_of_iterations <- 100
-number_of_cores <- 20
+number_of_iterations <- 1000
+number_of_cores <- 10
 start_exposed <- TRUE
 
 foci_day30_3foci <- pops_multirun(infected_file,
@@ -1200,8 +1205,8 @@ management <- TRUE
 treatments_file <- ffIn("treatments_3x3.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-number_of_iterations <- 100
-number_of_cores <- 20
+number_of_iterations <- 1000
+number_of_cores <- 10
 start_exposed <- TRUE
 
 foci_mid_3foci <- pops_multirun(infected_file,
@@ -1293,9 +1298,7 @@ management <- TRUE
 treatments_file <- ffIn("treatments_3x3.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-parameter_means[1] <- 2.60
-parameter_means[2] <- 1.30
-number_of_iterations <- 100
+number_of_iterations <- 1000
 number_of_cores <- 10
 start_exposed <- TRUE
 
@@ -1377,7 +1380,7 @@ ggplot(early_3foci_outputs, aes(distance_from_focus, mean_disease_prevalence, gr
   theme(legend.title = element_blank())
 
 ```
-Medium 15 days
+Large 15 days
 
 ```{r}
 start_date <- "2014-04-20"
@@ -1387,8 +1390,8 @@ management <- TRUE
 treatments_file <- ffIn("treatments_5x5.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-number_of_iterations <- 100
-number_of_cores <- 20
+number_of_iterations <- 1000
+number_of_cores <- 10
 start_exposed <- TRUE
 
 foci_day30_5foci <- pops_multirun(infected_file,
@@ -1470,9 +1473,7 @@ management <- TRUE
 treatments_file <- ffIn("treatments_5x5.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-parameter_means[1] <- 2.95
-parameter_means[2] <- 1.75
-number_of_iterations <- 100
+number_of_iterations <- 1000
 number_of_cores <- 10
 start_exposed <- TRUE
 
@@ -1565,9 +1566,7 @@ management <- TRUE
 treatments_file <- ffIn("treatments_5x5.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-parameter_means[1] <- 2.95
-parameter_means[2] <- 1.75
-number_of_iterations <- 100
+number_of_iterations <- 1000
 number_of_cores <- 10
 start_exposed <- TRUE
 
@@ -1660,9 +1659,7 @@ management <- TRUE
 treatments_file <- ffIn("treatments_5x5.tif")
 parameter_means <- t(read.csv(ffIn("means_control.csv")))
 parameter_cov_matrix <- read.csv(ffIn("cov_control.csv"))
-parameter_means[1] <- 2.95
-parameter_means[2] <- 1.75
-number_of_iterations <- 100
+number_of_iterations <- 1000
 number_of_cores <- 10
 start_exposed <- TRUE
 
